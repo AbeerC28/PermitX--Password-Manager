@@ -1,2 +1,4 @@
-// Service exports will be added in future tasks
-export {};
+// Service exports
+export { authService } from './authService';
+export { cryptoService } from './cryptoService';
+export { securityService } from './securityService';
