@@ -66,7 +66,7 @@ export class CryptoService {
   /**
    * Decrypt password using AES-256-GCM
    */
-  async decryptPassword(encryptedData: string): Promise<string> {
+  decryptPassword(encryptedData: string): string {
     try {
       const combined = Buffer.from(encryptedData, 'base64');
       
@@ -141,8 +141,61 @@ export class CryptoService {
   }
 
   /**
-   * Generate secure session token for password access
+   * Generate masked password for display (never shows actual password)
    */
+  static maskPassword(encryptedPassword: string): string {
+    try {
+      // Create a masked version that shows only dots
+      // Length is based on a hash of the encrypted password to be consistent
+      const hash = crypto.createHash('sha256').update(encryptedPassword).digest('hex');
+      const length = Math.max(8, Math.min(20, parseInt(hash.substring(0, 2), 16) % 16 + 8));
+      return '•'.repeat(length);
+    } catch (error) {
+      console.error('Password masking error:', error);
+      return '••••••••'; // Default mask
+    }
+  }
+
+  /**
+   * Validate session token format and basic structure
+   */
+  static validateSessionToken(token: string): boolean {
+    try {
+      if (!token || typeof token !== 'string') {
+        return false;
+      }
+
+      // Check token format: timestamp-hex-hex
+      const parts = token.split('-');
+      if (parts.length !== 3) {
+        return false;
+      }
+
+      // Validate timestamp part (base36)
+      const timestamp = parseInt(parts[0], 36);
+      if (isNaN(timestamp) || timestamp <= 0) {
+        return false;
+      }
+
+      // Check if token is not too old (24 hours max)
+      const tokenAge = Date.now() - timestamp;
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+      if (tokenAge > maxAge) {
+        return false;
+      }
+
+      // Validate hex parts
+      const hexPattern = /^[0-9a-f]+$/i;
+      if (!hexPattern.test(parts[1]) || !hexPattern.test(parts[2])) {
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Session token validation error:', error);
+      return false;
+    }
+  }
   generateSecureSessionToken(expirationMinutes: number = 60): SecureTokenResult {
     try {
       // Generate cryptographically secure random token

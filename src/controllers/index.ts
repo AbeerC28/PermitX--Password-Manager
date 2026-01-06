@@ -1,2 +1,3 @@
-// Controller exports will be added in future tasks
-export {};
+// Controller exports
+export { UserController } from './userController';
+export { PasswordController } from './passwordController';

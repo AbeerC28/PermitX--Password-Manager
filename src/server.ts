@@ -4,6 +4,9 @@ import helmet from 'helmet';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { config, DatabaseConnection, RedisConnection } from './config';
+import userRoutes from './routes/userRoutes';
+import requestRoutes from './routes/requestRoutes';
+import passwordRoutes from './routes/passwordRoutes';
 
 class Server {
   private app: express.Application;
@@ -52,7 +55,12 @@ class Server {
   }
 
   private initializeRoutes(): void {
-    // API routes will be added here in future tasks
+    // Mount API routes
+    this.app.use('/api/users', userRoutes);
+    this.app.use('/api/requests', requestRoutes);
+    this.app.use('/api/password', passwordRoutes);
+
+    // API info endpoint
     this.app.get('/api', (req, res) => {
       res.json({
         message: 'Auth Password Manager API',
