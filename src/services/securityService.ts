@@ -3,6 +3,7 @@ import { Request, Response, NextFunction } from 'express';
 import { RedisConnection } from '../config/redis';
 import { config } from '../config/environment';
 import { AuditLog } from '../models/AuditLog';
+import { notificationService } from './notificationService';
 
 export interface SecurityEvent {
   type: 'failed_login' | 'rate_limit_exceeded' | 'suspicious_activity' | 'account_lockout';

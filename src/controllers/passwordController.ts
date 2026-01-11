@@ -4,6 +4,7 @@ import { User } from '../models/User';
 import { AuditLog } from '../models/AuditLog';
 import { CryptoService } from '../services/cryptoService';
 import { AuthenticatedRequest } from '../middleware/authMiddleware';
+import { getSocketService } from '../services/socketService';
 import mongoose from 'mongoose';
 
 export class PasswordController {
@@ -174,6 +175,26 @@ export class PasswordController {
         severity: 'info'
       });
 
+      // Send real-time notification to user about password access
+      try {
+        const socketService = getSocketService();
+        socketService.notifyUser(approvalRequest.userEmail, 'password-accessed', {
+          requestId,
+          sessionExpiresAt: sessionResult.expiresAt,
+          accessedAt: new Date()
+        });
+
+        // Notify admins about password access
+        socketService.notifyAdmins('password-accessed', {
+          requestId,
+          userEmail: approvalRequest.userEmail,
+          accessedAt: new Date(),
+          sessionExpiresAt: sessionResult.expiresAt
+        });
+      } catch (socketError) {
+        console.error('Failed to send real-time password access notification:', socketError);
+      }
+
       res.status(200).json({
         success: true,
         data: {
@@ -323,6 +344,25 @@ export class PasswordController {
         timestamp: new Date(),
         severity: 'info'
       });
+
+      // Send real-time notification about clipboard copy
+      try {
+        const socketService = getSocketService();
+        socketService.notifyUser(approvalRequest.userEmail, 'password-copied', {
+          requestId: approvalRequest._id,
+          copiedAt: new Date(),
+          clearAfterSeconds: 60
+        });
+
+        // Notify admins about clipboard copy
+        socketService.notifyAdmins('password-copied', {
+          requestId: approvalRequest._id,
+          userEmail: approvalRequest.userEmail,
+          copiedAt: new Date()
+        });
+      } catch (socketError) {
+        console.error('Failed to send real-time clipboard copy notification:', socketError);
+      }
 
       // Return the actual password for clipboard copy
       // Note: This should be handled securely on the client side

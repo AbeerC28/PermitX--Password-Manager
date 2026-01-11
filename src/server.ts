@@ -4,14 +4,18 @@ import helmet from 'helmet';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { config, DatabaseConnection, RedisConnection } from './config';
+import { notificationScheduler, expirationService } from './services';
+import { initializeSocketService } from './services/socketService';
 import userRoutes from './routes/userRoutes';
 import requestRoutes from './routes/requestRoutes';
 import passwordRoutes from './routes/passwordRoutes';
+import adminRoutes from './routes/adminRoutes';
 
 class Server {
   private app: express.Application;
   private httpServer: any;
   private io: SocketIOServer;
+  private socketService: any;
 
   constructor() {
     this.app = express();
@@ -20,7 +24,11 @@ class Server {
       cors: {
         origin: config.corsOrigin,
         methods: ['GET', 'POST'],
+        credentials: true,
       },
+      transports: ['websocket', 'polling'],
+      pingTimeout: 60000,
+      pingInterval: 25000,
     });
 
     this.initializeMiddleware();
@@ -56,6 +64,7 @@ class Server {
 
   private initializeRoutes(): void {
     // Mount API routes
+    this.app.use('/api/admin', adminRoutes);
     this.app.use('/api/users', userRoutes);
     this.app.use('/api/requests', requestRoutes);
     this.app.use('/api/password', passwordRoutes);
@@ -83,15 +92,10 @@ class Server {
   }
 
   private initializeSocketIO(): void {
-    this.io.on('connection', (socket) => {
-      console.log(`Client connected: ${socket.id}`);
-
-      socket.on('disconnect', () => {
-        console.log(`Client disconnected: ${socket.id}`);
-      });
-
-      // Socket event handlers will be added in future tasks
-    });
+    // Initialize the socket service with authentication and room management
+    this.socketService = initializeSocketService(this.io);
+    
+    console.log('Socket.io server initialized with authentication and room management');
   }
 
   public async start(): Promise<void> {
@@ -99,6 +103,12 @@ class Server {
       // Connect to databases
       await DatabaseConnection.getInstance().connect();
       await RedisConnection.getInstance().connect();
+
+      // Start notification scheduler
+      notificationScheduler.start();
+
+      // Start expiration service
+      expirationService.start();
 
       // Start server
       this.httpServer.listen(config.port, () => {
@@ -115,6 +125,12 @@ class Server {
 
   public async stop(): Promise<void> {
     try {
+      // Stop notification scheduler
+      notificationScheduler.stop();
+
+      // Stop expiration service
+      expirationService.stop();
+
       // Close database connections
       await DatabaseConnection.getInstance().disconnect();
       await RedisConnection.getInstance().disconnect();

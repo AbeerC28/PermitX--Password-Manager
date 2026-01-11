@@ -3,6 +3,9 @@ import { ApprovalRequest } from '../models/ApprovalRequest';
 import { User } from '../models/User';
 import { AuditLog } from '../models/AuditLog';
 import { AuthenticatedRequest } from '../middleware/authMiddleware';
+import { sendAdminNotification, sendUserNotification } from '../services/notificationService';
+import { notificationScheduler } from '../services/notificationSchedulerService';
+import { getSocketService } from '../services/socketService';
 import mongoose from 'mongoose';
 
 export class RequestController {
@@ -123,6 +126,27 @@ export class RequestController {
         severity: 'info'
       });
 
+      // Send immediate notification to admin
+      try {
+        await notificationScheduler.sendImmediateNotification(
+          approvalRequest._id.toString(),
+          user.email
+        );
+
+        // Send real-time notification to connected admins
+        const socketService = getSocketService();
+        socketService.notifyAdmins('new-request', {
+          requestId: approvalRequest._id,
+          userEmail: user.email,
+          requestedAt: approvalRequest.requestedAt,
+          expiresAt: approvalRequest.expiresAt,
+          status: 'pending'
+        });
+      } catch (notificationError) {
+        console.error('Failed to send admin notification:', notificationError);
+        // Don't fail the request creation if notification fails
+      }
+
       res.status(201).json({
         success: true,
         data: {
@@ -231,6 +255,9 @@ export class RequestController {
         timestamp: new Date(),
         severity: 'info'
       });
+
+      // Update admin activity
+      notificationScheduler.updateAdminActivity();
 
       res.status(200).json({
         success: true,
@@ -350,6 +377,39 @@ export class RequestController {
         timestamp: new Date(),
         severity: 'info'
       });
+
+      // Update admin activity
+      notificationScheduler.updateAdminActivity();
+
+      // Send notification to user about approval
+      try {
+        await sendUserNotification('requestApproved', approvalRequest.userEmail, {
+          requestId: approvalRequest._id.toString(),
+          timestamp: new Date()
+        });
+
+        // Send real-time notification to user
+        const socketService = getSocketService();
+        socketService.notifyUser(approvalRequest.userEmail, 'request-approved', {
+          requestId: approvalRequest._id,
+          status: 'approved',
+          approvedAt: approvalRequest.respondedAt,
+          accessExpiresAt: approvalRequest.accessExpiresAt,
+          canAccessPassword: true
+        });
+
+        // Notify admins about the approval
+        socketService.notifyAdmins('request-processed', {
+          requestId: approvalRequest._id,
+          userEmail: approvalRequest.userEmail,
+          status: 'approved',
+          processedBy: req.admin?.username,
+          processedAt: approvalRequest.respondedAt
+        });
+      } catch (notificationError) {
+        console.error('Failed to send user notification:', notificationError);
+        // Don't fail the approval if notification fails
+      }
 
       res.status(200).json({
         success: true,
@@ -481,6 +541,41 @@ export class RequestController {
         timestamp: new Date(),
         severity: 'info'
       });
+
+      // Update admin activity
+      notificationScheduler.updateAdminActivity();
+
+      // Send notification to user about denial
+      try {
+        await sendUserNotification('requestDenied', approvalRequest.userEmail, {
+          requestId: approvalRequest._id.toString(),
+          reason: reason.trim(),
+          timestamp: new Date()
+        });
+
+        // Send real-time notification to user
+        const socketService = getSocketService();
+        socketService.notifyUser(approvalRequest.userEmail, 'request-denied', {
+          requestId: approvalRequest._id,
+          status: 'denied',
+          deniedAt: approvalRequest.respondedAt,
+          reason: reason.trim(),
+          canAccessPassword: false
+        });
+
+        // Notify admins about the denial
+        socketService.notifyAdmins('request-processed', {
+          requestId: approvalRequest._id,
+          userEmail: approvalRequest.userEmail,
+          status: 'denied',
+          processedBy: req.admin?.username,
+          processedAt: approvalRequest.respondedAt,
+          reason: reason.trim()
+        });
+      } catch (notificationError) {
+        console.error('Failed to send user notification:', notificationError);
+        // Don't fail the denial if notification fails
+      }
 
       res.status(200).json({
         success: true,

@@ -3,6 +3,7 @@ import { RedisConnection } from '../config/redis';
 import { config } from '../config/environment';
 import { Admin, IAdminModel } from '../models/Admin';
 import { AuditLog } from '../models/AuditLog';
+import { notificationScheduler } from './notificationSchedulerService';
 
 export interface SessionData {
   adminId: string;
@@ -116,6 +117,9 @@ export class AuthService {
         severity: 'info'
       });
 
+      // Update admin activity for notification scheduler
+      notificationScheduler.updateAdminActivity();
+
       return {
         success: true,
         admin,
@@ -213,6 +217,9 @@ export class AuthService {
         sessionTTL,
         JSON.stringify(sessionData)
       );
+
+      // Update admin activity for notification scheduler
+      notificationScheduler.updateAdminActivity();
 
       return {
         valid: true,
