@@ -4,6 +4,7 @@ import { AuditLog } from '../models/AuditLog';
 import { AuthenticatedRequest } from '../middleware/authMiddleware';
 import { authService } from '../services/authService';
 import { notificationScheduler } from '../services/notificationSchedulerService';
+import { securityService } from '../services/securityService';
 
 /**
  * Admin login
@@ -510,6 +511,326 @@ export const setupAdmin = async (req: AuthenticatedRequest, res: Response): Prom
       error: {
         code: 'SETUP_ERROR',
         message: error instanceof Error ? error.message : 'Failed to create admin',
+        timestamp: new Date().toISOString(),
+        requestId: req.id || 'unknown'
+      }
+    });
+  }
+};
+
+/**
+ * Get security report
+ * GET /api/admin/security/report
+ */
+export const getSecurityReport = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.admin) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'NOT_AUTHENTICATED',
+          message: 'Admin authentication required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const hours = parseInt(req.query.hours as string) || 24;
+    
+    if (hours < 1 || hours > 168) { // Max 1 week
+      res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_HOURS',
+          message: 'Hours must be between 1 and 168',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const report = await securityService.generateSecurityReport(hours);
+
+    // Update admin activity
+    notificationScheduler.updateAdminActivity();
+
+    // Log security report access
+    await AuditLog.create({
+      action: 'security_report_accessed',
+      adminId: req.admin.adminId,
+      details: { 
+        reportHours: hours,
+        reportSummary: {
+          totalEvents: report.failedLogins + report.rateLimitExceeded + report.suspiciousActivity + report.accountLockouts,
+          activeAlerts: report.activeAlerts
+        }
+      },
+      ipAddress: req.ip || 'unknown',
+      userAgent: req.get('User-Agent') || 'unknown',
+      timestamp: new Date(),
+      severity: 'info'
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        report,
+        generatedAt: new Date().toISOString(),
+        timeRange: `${hours} hours`
+      },
+      timestamp: new Date().toISOString(),
+      requestId: req.id
+    });
+
+  } catch (error) {
+    console.error('Get security report error:', error);
+
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'SECURITY_REPORT_ERROR',
+        message: 'Failed to generate security report',
+        timestamp: new Date().toISOString(),
+        requestId: req.id || 'unknown'
+      }
+    });
+  }
+};
+
+/**
+ * Get security alerts
+ * GET /api/admin/security/alerts
+ */
+export const getSecurityAlerts = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.admin) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'NOT_AUTHENTICATED',
+          message: 'Admin authentication required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const limit = parseInt(req.query.limit as string) || 50;
+    const includeAcknowledged = req.query.includeAcknowledged === 'true';
+
+    if (limit < 1 || limit > 100) {
+      res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_LIMIT',
+          message: 'Limit must be between 1 and 100',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const alerts = await securityService.getActiveSecurityAlerts(limit);
+    
+    // Filter out acknowledged alerts if not requested
+    const filteredAlerts = includeAcknowledged 
+      ? alerts 
+      : alerts.filter(alert => !alert.acknowledged);
+
+    // Update admin activity
+    notificationScheduler.updateAdminActivity();
+
+    // Log security alerts access
+    await AuditLog.create({
+      action: 'security_alerts_accessed',
+      adminId: req.admin.adminId,
+      details: { 
+        alertCount: filteredAlerts.length,
+        includeAcknowledged,
+        limit
+      },
+      ipAddress: req.ip || 'unknown',
+      userAgent: req.get('User-Agent') || 'unknown',
+      timestamp: new Date(),
+      severity: 'info'
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        alerts: filteredAlerts,
+        totalCount: filteredAlerts.length,
+        includeAcknowledged
+      },
+      timestamp: new Date().toISOString(),
+      requestId: req.id
+    });
+
+  } catch (error) {
+    console.error('Get security alerts error:', error);
+
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'SECURITY_ALERTS_ERROR',
+        message: 'Failed to retrieve security alerts',
+        timestamp: new Date().toISOString(),
+        requestId: req.id || 'unknown'
+      }
+    });
+  }
+};
+
+/**
+ * Acknowledge security alert
+ * PUT /api/admin/security/alerts/:alertId/acknowledge
+ */
+export const acknowledgeSecurityAlert = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.admin) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'NOT_AUTHENTICATED',
+          message: 'Admin authentication required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const { alertId } = req.params;
+
+    if (!alertId) {
+      res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_ALERT_ID',
+          message: 'Alert ID is required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const success = await securityService.acknowledgeSecurityAlert(alertId, req.admin.adminId);
+
+    if (!success) {
+      res.status(404).json({
+        success: false,
+        error: {
+          code: 'ALERT_NOT_FOUND',
+          message: 'Security alert not found',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    // Update admin activity
+    notificationScheduler.updateAdminActivity();
+
+    res.status(200).json({
+      success: true,
+      message: 'Security alert acknowledged successfully',
+      timestamp: new Date().toISOString(),
+      requestId: req.id
+    });
+
+  } catch (error) {
+    console.error('Acknowledge security alert error:', error);
+
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'ACKNOWLEDGE_ALERT_ERROR',
+        message: 'Failed to acknowledge security alert',
+        timestamp: new Date().toISOString(),
+        requestId: req.id || 'unknown'
+      }
+    });
+  }
+};
+
+/**
+ * Analyze IP address
+ * GET /api/admin/security/ip/:ipAddress
+ */
+export const analyzeIPAddress = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.admin) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'NOT_AUTHENTICATED',
+          message: 'Admin authentication required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const { ipAddress } = req.params;
+
+    if (!ipAddress) {
+      res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_IP_ADDRESS',
+          message: 'IP address is required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+      return;
+    }
+
+    const analysis = await securityService.analyzeIPAddress(ipAddress);
+
+    // Update admin activity
+    notificationScheduler.updateAdminActivity();
+
+    // Log IP analysis access
+    await AuditLog.create({
+      action: 'ip_analysis_accessed',
+      adminId: req.admin.adminId,
+      details: { 
+        analyzedIP: ipAddress,
+        riskScore: analysis.riskScore,
+        requestCount: analysis.requestCount
+      },
+      ipAddress: req.ip || 'unknown',
+      userAgent: req.get('User-Agent') || 'unknown',
+      timestamp: new Date(),
+      severity: 'info'
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        analysis
+      },
+      timestamp: new Date().toISOString(),
+      requestId: req.id
+    });
+
+  } catch (error) {
+    console.error('Analyze IP address error:', error);
+
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'IP_ANALYSIS_ERROR',
+        message: 'Failed to analyze IP address',
         timestamp: new Date().toISOString(),
         requestId: req.id || 'unknown'
       }

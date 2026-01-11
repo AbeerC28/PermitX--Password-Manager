@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { authService } from '../services/authService';
+import { securityService } from '../services/securityService';
 import { AuditLog } from '../models/AuditLog';
 
 // Extend Request interface to include admin data
@@ -46,6 +47,13 @@ export const authenticateAdmin = async (
     const validation = await authService.validateToken(token);
     
     if (!validation.valid || !validation.payload || !validation.session) {
+      // Record failed authentication for security monitoring
+      await securityService.recordFailedLogin(
+        validation.payload?.username || 'unknown',
+        req.ip || 'unknown',
+        req.get('User-Agent') || 'unknown'
+      );
+
       // Log failed authentication attempt
       await AuditLog.create({
         action: 'admin_auth_failed',
@@ -71,6 +79,9 @@ export const authenticateAdmin = async (
       });
       return;
     }
+
+    // Clear failed login attempts on successful authentication
+    await securityService.clearFailedLogins(validation.payload.username);
 
     // Attach admin data to request
     req.admin = {

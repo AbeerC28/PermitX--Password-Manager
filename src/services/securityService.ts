@@ -3,14 +3,38 @@ import { Request, Response, NextFunction } from 'express';
 import { RedisConnection } from '../config/redis';
 import { config } from '../config/environment';
 import { AuditLog } from '../models/AuditLog';
-import { notificationService } from './notificationService';
+import { sendAdminNotification } from './notificationService';
 
 export interface SecurityEvent {
-  type: 'failed_login' | 'rate_limit_exceeded' | 'suspicious_activity' | 'account_lockout';
+  type: 'failed_login' | 'rate_limit_exceeded' | 'suspicious_activity' | 'account_lockout' | 'brute_force_attack' | 'unusual_access_pattern' | 'multiple_ip_access';
   ipAddress: string;
   userAgent: string;
   details: Record<string, any>;
   timestamp: Date;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+}
+
+export interface SecurityAlert {
+  id: string;
+  type: SecurityEvent['type'];
+  severity: SecurityEvent['severity'];
+  message: string;
+  details: Record<string, any>;
+  ipAddress: string;
+  timestamp: Date;
+  acknowledged: boolean;
+}
+
+export interface IPAnalysis {
+  ipAddress: string;
+  requestCount: number;
+  failedLogins: number;
+  suspiciousActivities: number;
+  firstSeen: Date;
+  lastSeen: Date;
+  userAgents: string[];
+  endpoints: string[];
+  riskScore: number;
 }
 
 export interface AccountLockoutInfo {
@@ -27,6 +51,12 @@ export class SecurityService {
   private readonly suspiciousActivityThreshold = 10;
   private readonly rateLimitWindowMs = config.rateLimitWindowMs;
   private readonly rateLimitMaxRequests = config.rateLimitMaxRequests;
+  private readonly alertThresholds = {
+    bruteForce: 10, // Failed logins from same IP in 1 hour
+    multipleIPs: 5, // Same user from different IPs in 1 hour
+    unusualPattern: 20, // Requests from same IP in 10 minutes
+    criticalEvents: 1 // Immediate alert for critical events
+  };
 
   constructor() {
     this.initializeRedis();
@@ -76,7 +106,8 @@ export class SecurityService {
             rateLimitWindow: windowMs,
             rateLimitMax: max
           },
-          timestamp: new Date()
+          timestamp: new Date(),
+          severity: 'medium'
         });
 
         res.status(429).json({
@@ -163,8 +194,12 @@ export class SecurityService {
           failedAttempts,
           threshold: this.maxFailedAttempts
         },
-        timestamp: now
+        timestamp: now,
+        severity: failedAttempts >= this.maxFailedAttempts ? 'high' : 'medium'
       });
+
+      // Check for brute force attack
+      await this.detectBruteForceAttack(ipAddress, userAgent);
 
       // Check if lockout threshold reached
       if (failedAttempts >= this.maxFailedAttempts) {
@@ -191,7 +226,21 @@ export class SecurityService {
             lockoutDuration: this.lockoutDurationMs,
             lockoutUntil: lockoutUntil.toISOString()
           },
-          timestamp: now
+          timestamp: now,
+          severity: 'high'
+        });
+
+        // Generate critical security alert
+        await this.generateSecurityAlert({
+          type: 'account_lockout',
+          severity: 'high',
+          ipAddress,
+          userAgent,
+          details: {
+            identifier,
+            lockoutDuration: this.lockoutDurationMs,
+            lockoutUntil: lockoutUntil.toISOString()
+          }
         });
 
         return {
@@ -288,7 +337,17 @@ export class SecurityService {
             threshold: this.suspiciousActivityThreshold,
             timeWindow: windowMs
           },
-          timestamp: new Date()
+          timestamp: new Date(),
+          severity: 'medium'
+        });
+
+        // Generate security alert
+        await this.generateSecurityAlert({
+          type: 'suspicious_activity',
+          severity: 'medium',
+          ipAddress,
+          userAgent,
+          details: { activityCount, threshold: this.suspiciousActivityThreshold }
         });
 
         return true;
@@ -298,6 +357,505 @@ export class SecurityService {
     } catch (error) {
       console.error('Failed to detect suspicious activity:', error);
       return false;
+    }
+  }
+
+  /**
+   * Analyze IP address for security risks
+   */
+  async analyzeIPAddress(ipAddress: string): Promise<IPAnalysis> {
+    try {
+      const key = `ip_analysis:${ipAddress}`;
+      const windowMs = 24 * 60 * 60 * 1000; // 24 hours
+      const since = new Date(Date.now() - windowMs);
+
+      // Get events from audit log for this IP
+      const events = await AuditLog.find({
+        ipAddress,
+        timestamp: { $gte: since }
+      }).lean();
+
+      const analysis: IPAnalysis = {
+        ipAddress,
+        requestCount: events.length,
+        failedLogins: 0,
+        suspiciousActivities: 0,
+        firstSeen: events.length > 0 ? new Date(Math.min(...events.map(e => e.timestamp.getTime()))) : new Date(),
+        lastSeen: events.length > 0 ? new Date(Math.max(...events.map(e => e.timestamp.getTime()))) : new Date(),
+        userAgents: [...new Set(events.map(e => e.userAgent).filter(Boolean))],
+        endpoints: [...new Set(events.map(e => e.details?.endpoint).filter(Boolean))],
+        riskScore: 0
+      };
+
+      // Count specific event types
+      for (const event of events) {
+        if (event.action === 'security_failed_login') {
+          analysis.failedLogins++;
+        }
+        if (event.action === 'security_suspicious_activity') {
+          analysis.suspiciousActivities++;
+        }
+      }
+
+      // Calculate risk score
+      analysis.riskScore = this.calculateRiskScore(analysis);
+
+      // Cache analysis for 1 hour
+      await this.redis.getClient().setEx(
+        key,
+        3600,
+        JSON.stringify(analysis)
+      );
+
+      return analysis;
+    } catch (error) {
+      console.error('Failed to analyze IP address:', error);
+      return {
+        ipAddress,
+        requestCount: 0,
+        failedLogins: 0,
+        suspiciousActivities: 0,
+        firstSeen: new Date(),
+        lastSeen: new Date(),
+        userAgents: [],
+        endpoints: [],
+        riskScore: 0
+      };
+    }
+  }
+
+  /**
+   * Calculate risk score for an IP address
+   */
+  private calculateRiskScore(analysis: IPAnalysis): number {
+    let score = 0;
+
+    // High request volume
+    if (analysis.requestCount > 100) score += 20;
+    else if (analysis.requestCount > 50) score += 10;
+
+    // Failed login attempts
+    if (analysis.failedLogins > 10) score += 30;
+    else if (analysis.failedLogins > 5) score += 15;
+
+    // Suspicious activities
+    score += analysis.suspiciousActivities * 10;
+
+    // Multiple user agents (potential bot)
+    if (analysis.userAgents.length > 5) score += 15;
+
+    // Multiple endpoints accessed
+    if (analysis.endpoints.length > 10) score += 10;
+
+    // Time-based patterns (very recent activity)
+    const hoursSinceFirst = (Date.now() - analysis.firstSeen.getTime()) / (1000 * 60 * 60);
+    if (hoursSinceFirst < 1 && analysis.requestCount > 20) score += 25;
+
+    return Math.min(score, 100); // Cap at 100
+  }
+
+  /**
+   * Detect brute force attacks
+   */
+  async detectBruteForceAttack(ipAddress: string, userAgent: string): Promise<boolean> {
+    try {
+      const key = `brute_force:${ipAddress}`;
+      const windowMs = 60 * 60 * 1000; // 1 hour window
+      
+      // Get failed login count for this IP
+      const failedLogins = await this.redis.getClient().incr(key);
+      await this.redis.getClient().expire(key, Math.floor(windowMs / 1000));
+
+      if (failedLogins >= this.alertThresholds.bruteForce) {
+        await this.logSecurityEvent({
+          type: 'brute_force_attack',
+          ipAddress,
+          userAgent,
+          details: {
+            failedLogins,
+            threshold: this.alertThresholds.bruteForce,
+            timeWindow: windowMs
+          },
+          timestamp: new Date(),
+          severity: 'high'
+        });
+
+        // Generate critical security alert
+        await this.generateSecurityAlert({
+          type: 'brute_force_attack',
+          severity: 'high',
+          ipAddress,
+          userAgent,
+          details: { failedLogins, threshold: this.alertThresholds.bruteForce }
+        });
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error('Failed to detect brute force attack:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Detect multiple IP access for same user
+   */
+  async detectMultipleIPAccess(userId: string, ipAddress: string, userAgent: string): Promise<boolean> {
+    try {
+      const key = `user_ips:${userId}`;
+      const windowMs = 60 * 60 * 1000; // 1 hour window
+      
+      // Get current IPs for this user
+      const ipsData = await this.redis.getClient().get(key);
+      const ips = ipsData ? JSON.parse(ipsData) : [];
+      
+      // Add current IP if not already present
+      if (!ips.includes(ipAddress)) {
+        ips.push(ipAddress);
+        await this.redis.getClient().setEx(
+          key,
+          Math.floor(windowMs / 1000),
+          JSON.stringify(ips)
+        );
+      }
+
+      if (ips.length >= this.alertThresholds.multipleIPs) {
+        await this.logSecurityEvent({
+          type: 'multiple_ip_access',
+          ipAddress,
+          userAgent,
+          details: {
+            userId,
+            ipAddresses: ips,
+            threshold: this.alertThresholds.multipleIPs,
+            timeWindow: windowMs
+          },
+          timestamp: new Date(),
+          severity: 'medium'
+        });
+
+        // Generate security alert
+        await this.generateSecurityAlert({
+          type: 'multiple_ip_access',
+          severity: 'medium',
+          ipAddress,
+          userAgent,
+          details: { userId, ipAddresses: ips, threshold: this.alertThresholds.multipleIPs }
+        });
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error('Failed to detect multiple IP access:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Detect unusual access patterns
+   */
+  async detectUnusualAccessPattern(ipAddress: string, userAgent: string, endpoint: string): Promise<boolean> {
+    try {
+      const key = `access_pattern:${ipAddress}`;
+      const windowMs = 10 * 60 * 1000; // 10 minutes window
+      
+      // Track requests per endpoint
+      const patternData = await this.redis.getClient().get(key);
+      const pattern = patternData ? JSON.parse(patternData) : { requests: 0, endpoints: {} };
+      
+      pattern.requests++;
+      pattern.endpoints[endpoint] = (pattern.endpoints[endpoint] || 0) + 1;
+      
+      await this.redis.getClient().setEx(
+        key,
+        Math.floor(windowMs / 1000),
+        JSON.stringify(pattern)
+      );
+
+      if (pattern.requests >= this.alertThresholds.unusualPattern) {
+        await this.logSecurityEvent({
+          type: 'unusual_access_pattern',
+          ipAddress,
+          userAgent,
+          details: {
+            requests: pattern.requests,
+            endpoints: pattern.endpoints,
+            threshold: this.alertThresholds.unusualPattern,
+            timeWindow: windowMs
+          },
+          timestamp: new Date(),
+          severity: 'medium'
+        });
+
+        // Generate security alert
+        await this.generateSecurityAlert({
+          type: 'unusual_access_pattern',
+          severity: 'medium',
+          ipAddress,
+          userAgent,
+          details: { requests: pattern.requests, endpoints: pattern.endpoints }
+        });
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error('Failed to detect unusual access pattern:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Generate security alert and notify admin
+   */
+  async generateSecurityAlert(alertData: {
+    type: SecurityEvent['type'];
+    severity: SecurityEvent['severity'];
+    ipAddress: string;
+    userAgent: string;
+    details: Record<string, any>;
+  }): Promise<SecurityAlert> {
+    try {
+      const alertId = `alert_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const alert: SecurityAlert = {
+        id: alertId,
+        type: alertData.type,
+        severity: alertData.severity,
+        message: this.generateAlertMessage(alertData.type, alertData.details),
+        details: alertData.details,
+        ipAddress: alertData.ipAddress,
+        timestamp: new Date(),
+        acknowledged: false
+      };
+
+      // Store alert in Redis for admin dashboard
+      const alertKey = `security_alert:${alertId}`;
+      await this.redis.getClient().setEx(
+        alertKey,
+        7 * 24 * 60 * 60, // 7 days
+        JSON.stringify(alert)
+      );
+
+      // Add to active alerts list
+      await this.redis.getClient().lPush('active_security_alerts', alertId);
+      await this.redis.getClient().lTrim('active_security_alerts', 0, 99); // Keep last 100 alerts
+
+      // Send immediate notification to admin for high/critical severity
+      if (alertData.severity === 'high' || alertData.severity === 'critical') {
+        await this.sendSecurityAlertNotification(alert);
+      }
+
+      // Log the alert generation
+      await AuditLog.create({
+        action: 'security_alert_generated',
+        details: {
+          alertId,
+          alertType: alert.type,
+          severity: alert.severity,
+          message: alert.message
+        },
+        ipAddress: alertData.ipAddress,
+        userAgent: alertData.userAgent,
+        timestamp: new Date(),
+        severity: 'warning'
+      });
+
+      return alert;
+    } catch (error) {
+      console.error('Failed to generate security alert:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Generate human-readable alert message
+   */
+  private generateAlertMessage(type: SecurityEvent['type'], details: Record<string, any>): string {
+    switch (type) {
+      case 'brute_force_attack':
+        return `Brute force attack detected: ${details.failedLogins} failed login attempts from IP ${details.ipAddress || 'unknown'}`;
+      
+      case 'suspicious_activity':
+        return `Suspicious activity detected: ${details.activityCount} requests from IP ${details.ipAddress || 'unknown'} in the last hour`;
+      
+      case 'multiple_ip_access':
+        return `User accessed from ${details.ipAddresses?.length || 0} different IP addresses within 1 hour`;
+      
+      case 'unusual_access_pattern':
+        return `Unusual access pattern: ${details.requests} requests to multiple endpoints from same IP`;
+      
+      case 'account_lockout':
+        return `Account locked due to ${details.failedAttempts} failed login attempts`;
+      
+      case 'rate_limit_exceeded':
+        return `Rate limit exceeded for endpoint ${details.endpoint}`;
+      
+      default:
+        return `Security event detected: ${type}`;
+    }
+  }
+
+  /**
+   * Send security alert notification to admin
+   */
+  private async sendSecurityAlertNotification(alert: SecurityAlert): Promise<void> {
+    try {
+      const subject = `🚨 Security Alert: ${alert.type.replace(/_/g, ' ').toUpperCase()}`;
+      const message = `
+Security Alert Details:
+- Type: ${alert.type.replace(/_/g, ' ')}
+- Severity: ${alert.severity.toUpperCase()}
+- IP Address: ${alert.ipAddress}
+- Time: ${alert.timestamp.toISOString()}
+- Message: ${alert.message}
+
+Please review the admin dashboard for more details.
+      `.trim();
+
+      await sendAdminNotification('security_alert', {
+        subject,
+        message,
+        priority: alert.severity === 'critical' ? 'high' : 'normal',
+        alertId: alert.id,
+        alertType: alert.type,
+        severity: alert.severity,
+        ipAddress: alert.ipAddress
+      });
+    } catch (error) {
+      console.error('Failed to send security alert notification:', error);
+    }
+  }
+
+  /**
+   * Get active security alerts
+   */
+  async getActiveSecurityAlerts(limit: number = 50): Promise<SecurityAlert[]> {
+    try {
+      const alertIds = await this.redis.getClient().lRange('active_security_alerts', 0, limit - 1);
+      const alerts: SecurityAlert[] = [];
+
+      for (const alertId of alertIds) {
+        const alertData = await this.redis.getClient().get(`security_alert:${alertId}`);
+        if (alertData) {
+          alerts.push(JSON.parse(alertData));
+        }
+      }
+
+      return alerts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+    } catch (error) {
+      console.error('Failed to get active security alerts:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Acknowledge security alert
+   */
+  async acknowledgeSecurityAlert(alertId: string, adminId: string): Promise<boolean> {
+    try {
+      const alertKey = `security_alert:${alertId}`;
+      const alertData = await this.redis.getClient().get(alertKey);
+      
+      if (!alertData) {
+        return false;
+      }
+
+      const alert: SecurityAlert = JSON.parse(alertData);
+      alert.acknowledged = true;
+
+      await this.redis.getClient().setEx(
+        alertKey,
+        7 * 24 * 60 * 60, // 7 days
+        JSON.stringify(alert)
+      );
+
+      // Log acknowledgment
+      await AuditLog.create({
+        action: 'security_alert_acknowledged',
+        adminId,
+        details: {
+          alertId,
+          alertType: alert.type,
+          severity: alert.severity
+        },
+        timestamp: new Date(),
+        severity: 'info'
+      });
+
+      return true;
+    } catch (error) {
+      console.error('Failed to acknowledge security alert:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Comprehensive security monitoring middleware
+   */
+  securityMonitoringMiddleware() {
+    return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+      try {
+        const ipAddress = this.getClientIP(req);
+        const userAgent = req.get('User-Agent') || 'Unknown';
+        const endpoint = req.path;
+
+        // Track request for IP analysis
+        await this.trackRequest(ipAddress, userAgent, endpoint);
+
+        // Detect various security threats
+        await Promise.all([
+          this.detectUnusualAccessPattern(ipAddress, userAgent, endpoint),
+          this.detectSuspiciousActivity(ipAddress, userAgent)
+        ]);
+
+        next();
+      } catch (error) {
+        console.error('Security monitoring middleware error:', error);
+        next(); // Continue on error to avoid blocking legitimate requests
+      }
+    };
+  }
+
+  /**
+   * Track request for analysis
+   */
+  private async trackRequest(ipAddress: string, userAgent: string, endpoint: string): Promise<void> {
+    try {
+      // Update IP tracking
+      const trackingKey = `ip_tracking:${ipAddress}`;
+      const trackingData = await this.redis.getClient().get(trackingKey);
+      const tracking = trackingData ? JSON.parse(trackingData) : {
+        requestCount: 0,
+        endpoints: [],
+        userAgents: [],
+        firstSeen: new Date().toISOString(),
+        lastSeen: new Date().toISOString()
+      };
+
+      tracking.requestCount++;
+      tracking.lastSeen = new Date().toISOString();
+      
+      if (!tracking.endpoints.includes(endpoint)) {
+        tracking.endpoints.push(endpoint);
+      }
+      
+      if (!tracking.userAgents.includes(userAgent)) {
+        tracking.userAgents.push(userAgent);
+      }
+
+      await this.redis.getClient().setEx(
+        trackingKey,
+        24 * 60 * 60, // 24 hours
+        JSON.stringify(tracking)
+      );
+    } catch (error) {
+      console.error('Failed to track request:', error);
     }
   }
 
@@ -375,7 +933,7 @@ export class SecurityService {
         ipAddress: event.ipAddress,
         userAgent: event.userAgent,
         timestamp: event.timestamp,
-        severity: event.type === 'suspicious_activity' || event.type === 'account_lockout' ? 'warning' : 'info'
+        severity: event.severity === 'critical' || event.severity === 'high' ? 'warning' : 'info'
       });
     } catch (error) {
       console.error('Failed to log security event:', error);
@@ -405,7 +963,12 @@ export class SecurityService {
     rateLimitExceeded: number;
     suspiciousActivity: number;
     accountLockouts: number;
-    topIPs: Array<{ ip: string; count: number }>;
+    bruteForceAttacks: number;
+    multipleIPAccess: number;
+    unusualPatterns: number;
+    activeAlerts: number;
+    topIPs: Array<{ ip: string; count: number; riskScore: number }>;
+    alertsBySeverity: Record<string, number>;
   }> {
     try {
       const since = new Date(Date.now() - (hours * 60 * 60 * 1000));
@@ -421,21 +984,40 @@ export class SecurityService {
         rateLimitExceeded: 0,
         suspiciousActivity: 0,
         accountLockouts: 0,
-        topIPs: [] as Array<{ ip: string; count: number }>
+        bruteForceAttacks: 0,
+        multipleIPAccess: 0,
+        unusualPatterns: 0,
+        activeAlerts: 0,
+        topIPs: [] as Array<{ ip: string; count: number; riskScore: number }>,
+        alertsBySeverity: { low: 0, medium: 0, high: 0, critical: 0 }
       };
 
       const ipCounts: Record<string, number> = {};
 
       for (const event of events) {
         // Count by event type
-        if (event.action === 'security_failed_login') {
-          report.failedLogins++;
-        } else if (event.action === 'security_rate_limit_exceeded') {
-          report.rateLimitExceeded++;
-        } else if (event.action === 'security_suspicious_activity') {
-          report.suspiciousActivity++;
-        } else if (event.action === 'security_account_lockout') {
-          report.accountLockouts++;
+        switch (event.action) {
+          case 'security_failed_login':
+            report.failedLogins++;
+            break;
+          case 'security_rate_limit_exceeded':
+            report.rateLimitExceeded++;
+            break;
+          case 'security_suspicious_activity':
+            report.suspiciousActivity++;
+            break;
+          case 'security_account_lockout':
+            report.accountLockouts++;
+            break;
+          case 'security_brute_force_attack':
+            report.bruteForceAttacks++;
+            break;
+          case 'security_multiple_ip_access':
+            report.multipleIPAccess++;
+            break;
+          case 'security_unusual_access_pattern':
+            report.unusualPatterns++;
+            break;
         }
 
         // Count by IP
@@ -444,11 +1026,30 @@ export class SecurityService {
         }
       }
 
-      // Get top IPs
-      report.topIPs = Object.entries(ipCounts)
-        .map(([ip, count]) => ({ ip, count }))
-        .sort((a, b) => b.count - a.count)
+      // Get active alerts
+      const activeAlerts = await this.getActiveSecurityAlerts();
+      report.activeAlerts = activeAlerts.filter(alert => !alert.acknowledged).length;
+
+      // Count alerts by severity
+      for (const alert of activeAlerts) {
+        if (!alert.acknowledged) {
+          report.alertsBySeverity[alert.severity]++;
+        }
+      }
+
+      // Get top IPs with risk scores
+      const topIPEntries = Object.entries(ipCounts)
+        .sort(([, a], [, b]) => b - a)
         .slice(0, 10);
+
+      for (const [ip, count] of topIPEntries) {
+        const analysis = await this.analyzeIPAddress(ip);
+        report.topIPs.push({
+          ip,
+          count,
+          riskScore: analysis.riskScore
+        });
+      }
 
       return report;
     } catch (error) {
@@ -458,7 +1059,12 @@ export class SecurityService {
         rateLimitExceeded: 0,
         suspiciousActivity: 0,
         accountLockouts: 0,
-        topIPs: []
+        bruteForceAttacks: 0,
+        multipleIPAccess: 0,
+        unusualPatterns: 0,
+        activeAlerts: 0,
+        topIPs: [],
+        alertsBySeverity: { low: 0, medium: 0, high: 0, critical: 0 }
       };
     }
   }

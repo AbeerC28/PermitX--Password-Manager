@@ -5,7 +5,11 @@ import {
   getAdminProfile, 
   updateNotificationPreferences, 
   getNotificationPreferences,
-  setupAdmin 
+  setupAdmin,
+  getSecurityReport,
+  getSecurityAlerts,
+  acknowledgeSecurityAlert,
+  analyzeIPAddress
 } from '../controllers/adminController';
 import { 
   authenticateAdmin, 
@@ -105,6 +109,58 @@ router.put(
   logApiAccess,
   requireAdminPermission('update:preferences'),
   updateNotificationPreferences
+);
+
+/**
+ * @route   GET /api/admin/security/report
+ * @desc    Get security monitoring report
+ * @access  Private (Admin)
+ */
+router.get(
+  '/security/report',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:security'),
+  getSecurityReport
+);
+
+/**
+ * @route   GET /api/admin/security/alerts
+ * @desc    Get security alerts
+ * @access  Private (Admin)
+ */
+router.get(
+  '/security/alerts',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:security'),
+  getSecurityAlerts
+);
+
+/**
+ * @route   PUT /api/admin/security/alerts/:alertId/acknowledge
+ * @desc    Acknowledge security alert
+ * @access  Private (Admin)
+ */
+router.put(
+  '/security/alerts/:alertId/acknowledge',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('update:security'),
+  acknowledgeSecurityAlert
+);
+
+/**
+ * @route   GET /api/admin/security/ip/:ipAddress
+ * @desc    Analyze IP address for security risks
+ * @access  Private (Admin)
+ */
+router.get(
+  '/security/ip/:ipAddress',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:security'),
+  analyzeIPAddress
 );
 
 export default router;

@@ -6,6 +6,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { config, DatabaseConnection, RedisConnection } from './config';
 import { notificationScheduler, expirationService } from './services';
 import { initializeSocketService } from './services/socketService';
+import { securityService } from './services/securityService';
 import userRoutes from './routes/userRoutes';
 import requestRoutes from './routes/requestRoutes';
 import passwordRoutes from './routes/passwordRoutes';
@@ -51,6 +52,9 @@ class Server {
     // Body parsing middleware
     this.app.use(express.json({ limit: '10mb' }));
     this.app.use(express.urlencoded({ extended: true }));
+
+    // Security monitoring middleware
+    this.app.use(securityService.securityMonitoringMiddleware());
 
     // Health check endpoint
     this.app.get('/health', (req, res) => {
