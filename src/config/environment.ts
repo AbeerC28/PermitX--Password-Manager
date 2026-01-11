@@ -39,6 +39,11 @@ interface Config {
   rateLimitMaxRequests: number;
   sessionTimeoutMs: number;
 
+  // Audit Configuration
+  auditRetentionDays: number;
+  auditRetentionEnabled: boolean;
+  auditCleanupSchedule: string;
+
   // CORS Configuration
   corsOrigin: string;
 }
@@ -92,6 +97,11 @@ export const config: Config = {
     10
   ),
   sessionTimeoutMs: parseInt(process.env.SESSION_TIMEOUT_MS || '3600000', 10), // 1 hour
+
+  // Audit Configuration
+  auditRetentionDays: parseInt(process.env.AUDIT_RETENTION_DAYS || '90', 10),
+  auditRetentionEnabled: process.env.AUDIT_RETENTION_ENABLED !== 'false',
+  auditCleanupSchedule: process.env.AUDIT_CLEANUP_SCHEDULE || '0 2 * * 0', // Weekly at 2 AM on Sunday
 
   // CORS Configuration
   corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:3000',

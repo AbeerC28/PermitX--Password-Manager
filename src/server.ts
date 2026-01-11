@@ -4,7 +4,7 @@ import helmet from 'helmet';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { config, DatabaseConnection, RedisConnection } from './config';
-import { notificationScheduler, expirationService } from './services';
+import { notificationScheduler, expirationService, auditService } from './services';
 import { initializeSocketService } from './services/socketService';
 import { securityService } from './services/securityService';
 import userRoutes from './routes/userRoutes';
@@ -114,6 +114,9 @@ class Server {
       // Start expiration service
       expirationService.start();
 
+      // Initialize audit service (starts retention policy if enabled)
+      console.log('Audit service initialized with retention policy');
+
       // Start server
       this.httpServer.listen(config.port, () => {
         console.log(
@@ -134,6 +137,9 @@ class Server {
 
       // Stop expiration service
       expirationService.stop();
+
+      // Stop audit service
+      auditService.stop();
 
       // Close database connections
       await DatabaseConnection.getInstance().disconnect();

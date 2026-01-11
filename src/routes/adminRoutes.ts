@@ -9,7 +9,11 @@ import {
   getSecurityReport,
   getSecurityAlerts,
   acknowledgeSecurityAlert,
-  analyzeIPAddress
+  analyzeIPAddress,
+  getAuditLogs,
+  getAuditLogStats,
+  cleanupAuditLogs,
+  verifyAuditLogIntegrity
 } from '../controllers/adminController';
 import { 
   authenticateAdmin, 
@@ -161,6 +165,58 @@ router.get(
   logApiAccess,
   requireAdminPermission('read:security'),
   analyzeIPAddress
+);
+
+/**
+ * @route   GET /api/admin/audit/logs
+ * @desc    Get audit logs with search and filtering
+ * @access  Private (Admin)
+ */
+router.get(
+  '/audit/logs',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:audit'),
+  getAuditLogs
+);
+
+/**
+ * @route   GET /api/admin/audit/stats
+ * @desc    Get audit log statistics
+ * @access  Private (Admin)
+ */
+router.get(
+  '/audit/stats',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:audit'),
+  getAuditLogStats
+);
+
+/**
+ * @route   DELETE /api/admin/audit/cleanup
+ * @desc    Cleanup old audit logs (retention policy)
+ * @access  Private (Admin)
+ */
+router.delete(
+  '/audit/cleanup',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('delete:audit'),
+  cleanupAuditLogs
+);
+
+/**
+ * @route   GET /api/admin/audit/integrity
+ * @desc    Verify audit log integrity
+ * @access  Private (Admin)
+ */
+router.get(
+  '/audit/integrity',
+  authenticateAdmin,
+  logApiAccess,
+  requireAdminPermission('read:audit'),
+  verifyAuditLogIntegrity
 );
 
 export default router;
